@@ -1,0 +1,190 @@
+# The conjure fork's only CI. Every push to a conjure branch and every pull request into one builds the
+# libsql-server image for linux/amd64 and linux/arm64 and runs the metastore lock-order regression test.
+# A tag v<libsql-server version>-conjure.<n> also publishes the image to ghcr.io/<owner>/libsql-server under
+# <version>-conjure.<n> and the tag itself. Branch pushes never publish. See "This fork" in README.md.
+name: conjure
+
+on:
+  push:
+    branches: ["conjure", "conjure/**"]
+    tags: ["v*-conjure.*"]
+  pull_request:
+    branches: ["conjure", "conjure/**"]
+
+concurrency:
+  group: conjure-${{ github.ref }}
+  # A release tag always runs to the end.
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  PROTOC_VERSION: 3.23.4
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      upstream_version: ${{ steps.version.outputs.upstream_version }}
+      upstream_commit: ${{ steps.version.outputs.upstream_commit }}
+      image: ${{ steps.version.outputs.image }}
+      release: ${{ steps.version.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .github/conjure-upstream.env
+          cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' libsql-server/Cargo.toml | head -1)
+          if [ "$cargo_version" != "$UPSTREAM_VERSION" ]; then
+            echo "::error::libsql-server/Cargo.toml says $cargo_version, .github/conjure-upstream.env says $UPSTREAM_VERSION"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            if ! [[ "$GITHUB_REF_NAME" =~ ^v${UPSTREAM_VERSION//./\\.}-conjure\.[0-9]+$ ]]; then
+              echo "::error::tag $GITHUB_REF_NAME is not v$UPSTREAM_VERSION-conjure.<n>"
+              exit 1
+            fi
+            version=${GITHUB_REF_NAME#v}
+            release=true
+          else
+            version="$UPSTREAM_VERSION-conjure.dev.${GITHUB_SHA::12}"
+            release=false
+          fi
+          {
+            echo "version=$version"
+            echo "upstream_version=$UPSTREAM_VERSION"
+            echo "upstream_commit=$UPSTREAM_COMMIT"
+            echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/libsql-server"
+            echo "release=$release"
+          } >> "$GITHUB_OUTPUT"
+
+  regression-test:
+    name: Metastore regression test
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: --cfg tokio_unstable
+    steps:
+      - uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+      - run: sudo apt-get update && sudo apt-get install -y libclang-dev
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@${{ env.PROTOC_VERSION }}
+      - uses: actions/checkout@v4
+      # rustup reads rust-toolchain.toml and installs that toolchain on first use.
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test -p libsql-server --lib namespace::meta_store::test -- --nocapture
+        timeout-minutes: 60
+
+  image:
+    name: Image (${{ matrix.platform }})
+    needs: [version, regression-test]
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - id: platform
+        run: echo "pair=${PLATFORM//\//-}" >> "$GITHUB_OUTPUT"
+        env:
+          PLATFORM: ${{ matrix.platform }}
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - if: needs.version.outputs.release == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.title=libsql-server
+            org.opencontainers.image.description=libsql-server ${{ needs.version.outputs.upstream_version }} (upstream ${{ needs.version.outputs.upstream_commit }}) with Conjure's patches
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.base.name=tursodatabase/libsql-server
+            dev.conjure.upstream.version=${{ needs.version.outputs.upstream_version }}
+            dev.conjure.upstream.commit=${{ needs.version.outputs.upstream_commit }}
+          cache-from: type=gha,scope=${{ steps.platform.outputs.pair }}
+          cache-to: type=gha,mode=max,scope=${{ steps.platform.outputs.pair }}
+          outputs: type=image,name=${{ needs.version.outputs.image }},push-by-digest=true,name-canonical=true,push=${{ needs.version.outputs.release }}
+      - if: needs.version.outputs.release == 'true'
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+      - if: needs.version.outputs.release == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ steps.platform.outputs.pair }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish
+    if: needs.version.outputs.release == 'true'
+    needs: [version, image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push the multi-arch tags
+        working-directory: /tmp/digests
+        env:
+          IMAGE: ${{ needs.version.outputs.image }}
+          VERSION: ${{ needs.version.outputs.version }}
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}
+          UPSTREAM_VERSION: ${{ needs.version.outputs.upstream_version }}
+          UPSTREAM_COMMIT: ${{ needs.version.outputs.upstream_commit }}
+        run: |
+          docker buildx imagetools create \
+            -t "$IMAGE:$VERSION" -t "$IMAGE:v$VERSION" \
+            --annotation "index:org.opencontainers.image.source=$SOURCE" \
+            --annotation "index:org.opencontainers.image.revision=$GITHUB_SHA" \
+            --annotation "index:org.opencontainers.image.version=$VERSION" \
+            --annotation "index:org.opencontainers.image.description=libsql-server $UPSTREAM_VERSION (upstream $UPSTREAM_COMMIT) with Conjure's patches" \
+            $(printf "$IMAGE@sha256:%s " *)
+      - name: Inspect
+        env:
+          IMAGE: ${{ needs.version.outputs.image }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
+          echo "### Published \`$IMAGE:$VERSION\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Digest: \`$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest.Digest}}' | tr -d '"')\`" >> "$GITHUB_STEP_SUMMARY"

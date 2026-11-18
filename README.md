@@ -1,3 +1,33 @@
+# This fork: factory-kyle-mistele/libsql
+
+This fork builds the `libsql-server` (sqld) image that Conjure runs, with one patch on top of upstream. Everything else in this repository is upstream libsql; the upstream README follows below.
+
+- **Branch:** `conjure`, based on the upstream commit in [`.github/conjure-upstream.env`](.github/conjure-upstream.env) (today `main` @ `d6c75af6`, libsql-server `0.24.33`, the build Conjure pinned before this fork).
+- **Image:** `ghcr.io/factory-kyle-mistele/libsql-server:<version>-conjure.<n>` (also tagged `v<version>-conjure.<n>`), for `linux/amd64` and `linux/arm64`. Its labels carry the fork commit (`org.opencontainers.image.revision`), the upstream version and commit (`dev.conjure.upstream.version`, `dev.conjure.upstream.commit`) and the source repository.
+- **The patch:** the metastore flush that ends every namespace fork took the `configs` mutex and then `conn`, while a namespace delete (`MetaStore::remove`) takes `conn` and then `configs`. A fork finishing during a delete deadlocked both, and then every namespace call (create, fork, delete, config, every Hrana request) hung until sqld restarted, while `/health` still answered. The flush now takes `conn` first, as `remove` does (`libsql-server/src/namespace/meta_store.rs`); `flushes_and_removes_at_once_do_not_deadlock` in the same file is its regression test.
+- **Drop this fork** once an upstream libsql-server release takes the two mutexes in one order: point Conjure back at `ghcr.io/tursodatabase/libsql-server` by digest.
+
+## CI
+
+`.github/workflows/conjure.yml` is the only workflow that runs here; the upstream workflows are disabled in this fork's Actions settings (they would run on pull requests, and `publish-crsqlite.yml` on any `v*` tag). On every push to `conjure` (or `conjure/**`) and every pull request into it, it runs the regression test and builds the image for both platforms without pushing it. On a tag `v<version>-conjure.<n>`, it also checks that `<version>` matches `libsql-server/Cargo.toml` and `.github/conjure-upstream.env`, pushes both platform images and publishes the multi-arch tags. Plain branch pushes never publish.
+
+## Release
+
+1. Merge the change into `conjure`, and wait for CI to pass on it.
+2. Pick the next number: `n` is one more than the highest `v<version>-conjure.<n>` tag for this upstream version (`git tag -l 'v0.24.33-conjure.*'`), or `1` after a rebase onto a new upstream version.
+3. Tag and push: `git tag -a v0.24.33-conjure.2 -m "libsql-server 0.24.33, conjure.2: <what changed>" && git push origin v0.24.33-conjure.2`.
+4. When the `conjure` run for the tag finishes, its summary shows the tag and its digest. A new package starts private: the first publish needed **Package settings → Change visibility → Public** on GitHub, once.
+5. In Conjure, pin `ghcr.io/factory-kyle-mistele/libsql-server:<version>-conjure.<n>@sha256:<digest>` where sqld runs (see Conjure's `docs/sqld-fork.md`).
+
+## Rebase onto a new upstream release
+
+1. Fetch upstream: `git remote add upstream https://github.com/tursodatabase/libsql.git; git fetch upstream --tags`.
+2. Check first whether upstream fixed the lock order (`MetaStore::remove` and the flush branch of `process()` in `libsql-server/src/namespace/meta_store.rs`). If it did, drop this fork instead (above).
+3. Branch from the new base and replay the fork's commits: `git switch -c conjure/<new-version> <upstream tag or commit> && git cherry-pick <first fork commit>^..conjure`. Conflicts are usually only this README section.
+4. Update `.github/conjure-upstream.env` (`UPSTREAM_VERSION` from `libsql-server/Cargo.toml`, `UPSTREAM_COMMIT` the new base), and commit.
+5. Push `conjure/<new-version>`; CI runs the regression test and builds both images. Then move `conjure` to it (`git push origin conjure/<new-version>:conjure --force-with-lease`, after Conjure's tests pass on the image) and release as above, starting at `conjure.1`.
+
+---
 <!-- markdownlint-disable MD033 MD041 -->
 
 <p align="center">
