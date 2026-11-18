@@ -330,10 +330,13 @@ fn process(msg: ChangeMsg, inner: Arc<MetaStoreInner>) {
         let _ = ret_chan.send(ret);
     } else {
         let ret = if flush {
+            // Take "conn" before "configs", the order `MetaStore::remove` uses: taking "configs" first
+            // deadlocks against a concurrent remove, and every namespace call after it.
+            let mut conn = inner.conn.blocking_lock();
             let mut configs = inner.configs.blocking_lock();
             if let Some(config_watch) = configs.get_mut(&namespace) {
                 let config = config_watch.subscribe().borrow().clone();
-                try_process(&inner, &namespace, &config.config)
+                write_config(&inner, &mut conn, &namespace, &config.config)
             } else {
                 Ok(())
             }
@@ -349,9 +352,18 @@ fn try_process(
     namespace: &NamespaceName,
     config: &DatabaseConfig,
 ) -> Result<()> {
+    let mut conn = inner.conn.blocking_lock();
+    write_config(inner, &mut conn, namespace, config)
+}
+
+fn write_config(
+    inner: &MetaStoreInner,
+    conn: &mut MetaStoreConnection,
+    namespace: &NamespaceName,
+    config: &DatabaseConfig,
+) -> Result<()> {
     let config_encoded = metadata::DatabaseConfig::from(&*config).encode_to_vec();
 
-    let mut conn = inner.conn.blocking_lock();
     if let Some(schema) = config.shared_schema_name.as_ref() {
         let tx = conn.transaction()?;
         if inner.db_kind.is_primary() {
@@ -381,7 +393,7 @@ fn try_process(
         )?;
     }
 
-    if let Err(e) = checkpoint(&conn) {
+    if let Err(e) = checkpoint(conn) {
         tracing::warn!("failed to checkpoint metastore: {e}");
     }
 
