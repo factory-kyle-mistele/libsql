@@ -729,3 +729,69 @@ impl MetaStoreHandle {
         &self.namespace
     }
 }
+
+#[cfg(test)]
+mod test {
+    use std::time::Duration;
+
+    use tempfile::tempdir;
+    use tokio::task::JoinSet;
+
+    use super::*;
+
+    /// A fork ends with `MetaStoreHandle::flush`, whose processing took "configs" and then "conn",
+    /// while `MetaStore::remove` takes "conn" and then "configs": a fork finishing during a delete
+    /// deadlocked both, and every namespace call after them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flushes_and_removes_at_once_do_not_deadlock() {
+        let tmp = tempdir().unwrap();
+        let (maker, manager) = metastore_connection_maker(None, tmp.path()).await.unwrap();
+        let store = MetaStore::new(
+            Default::default(),
+            tmp.path(),
+            maker().unwrap(),
+            manager,
+            DatabaseKind::Primary,
+        )
+        .await
+        .unwrap();
+
+        let rounds = async {
+            for round in 0..200 {
+                let mut flushes = JoinSet::new();
+                let mut removes = JoinSet::new();
+
+                for index in 0..16 {
+                    let name = NamespaceName::from_string(format!("ns-{round}-{index}")).unwrap();
+                    let handle = store.handle(name.clone()).await;
+                    handle.store(DatabaseConfig::default()).await.unwrap();
+
+                    // Half the namespaces flush, as a fork does at its end, while the other half are removed.
+                    if index % 2 == 0 {
+                        flushes.spawn(async move { handle.flush().await });
+                    } else {
+                        let store = store.clone();
+                        removes.spawn_blocking(move || store.remove(name).map(|_| ()));
+                    }
+                }
+
+                while let Some(flushed) = flushes.join_next().await {
+                    flushed.unwrap().unwrap();
+                }
+
+                while let Some(removed) = removes.join_next().await {
+                    removed.unwrap().unwrap();
+                }
+            }
+        };
+
+        if tokio::time::timeout(Duration::from_secs(60), rounds)
+            .await
+            .is_err()
+        {
+            // The deadlocked blocking threads never return, and dropping the runtime would wait for them.
+            eprintln!("a flush and a remove at once deadlocked the metastore");
+            std::process::exit(1);
+        }
+    }
+}
