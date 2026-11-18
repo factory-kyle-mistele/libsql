@@ -1,6 +1,6 @@
 # This fork: factory-kyle-mistele/libsql
 
-This fork builds the `libsql-server` (sqld) image that Conjure runs, with one patch on top of upstream. Everything else in this repository is upstream libsql; the upstream README follows below.
+This fork builds the `libsql-server` (sqld) image that Conjure runs, with two changes on top of upstream: a fix for a metastore deadlock, and Debian bookworm instead of bullseye in the `Dockerfile` (bullseye's security archive is gone, so upstream's `Dockerfile` no longer builds). Everything else in this repository is upstream libsql; the upstream README follows below.
 
 - **Branch:** `conjure`, based on the upstream commit in [`.github/conjure-upstream.env`](.github/conjure-upstream.env) (today `main` @ `d6c75af6`, libsql-server `0.24.33`, the build Conjure pinned before this fork).
 - **Image:** `ghcr.io/factory-kyle-mistele/libsql-server:<version>-conjure.<n>` (also tagged `v<version>-conjure.<n>`), for `linux/amd64` and `linux/arm64`. Its labels carry the fork commit (`org.opencontainers.image.revision`), the upstream version and commit (`dev.conjure.upstream.version`, `dev.conjure.upstream.commit`) and the source repository.
@@ -23,7 +23,7 @@ This fork builds the `libsql-server` (sqld) image that Conjure runs, with one pa
 
 1. Fetch upstream: `git remote add upstream https://github.com/tursodatabase/libsql.git; git fetch upstream --tags`.
 2. Check first whether upstream fixed the lock order (`MetaStore::remove` and the flush branch of `process()` in `libsql-server/src/namespace/meta_store.rs`). If it did, drop this fork instead (above).
-3. Branch from the new base and replay the fork's commits: `git switch -c conjure/<new-version> <upstream tag or commit> && git cherry-pick <first fork commit>^..conjure`. Conflicts are usually only this README section.
+3. Branch from the new base and replay the fork's commits (every commit on `conjure` after `UPSTREAM_COMMIT`): `git switch -c conjure/<new-version> <upstream tag or commit> && git cherry-pick <UPSTREAM_COMMIT>..conjure`. Conflicts are usually only this README section; drop the bookworm commit if upstream's `Dockerfile` has moved past bullseye.
 4. Update `.github/conjure-upstream.env` (`UPSTREAM_VERSION` from `libsql-server/Cargo.toml`, `UPSTREAM_COMMIT` the new base), and commit.
 5. Push `conjure/<new-version>`; CI runs the regression test and builds both images. Then move `conjure` to it (`git push origin conjure/<new-version>:conjure --force-with-lease`, after Conjure's tests pass on the image) and release as above, starting at `conjure.1`.
 
