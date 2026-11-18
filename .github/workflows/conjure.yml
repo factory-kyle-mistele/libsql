@@ -124,7 +124,7 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ needs.version.outputs.version }}
             org.opencontainers.image.licenses=MIT
-            org.opencontainers.image.base.name=tursodatabase/libsql-server
+            dev.conjure.upstream.repository=https://github.com/tursodatabase/libsql
             dev.conjure.upstream.version=${{ needs.version.outputs.upstream_version }}
             dev.conjure.upstream.commit=${{ needs.version.outputs.upstream_commit }}
           cache-from: type=gha,scope=${{ steps.platform.outputs.pair }}
