@@ -4,8 +4,8 @@ This fork builds the `libsql-server` (sqld) image that Conjure runs, with two ch
 
 - **Branch:** `conjure`, based on the upstream commit in [`.github/conjure-upstream.env`](.github/conjure-upstream.env) (today `main` @ `d6c75af6`, libsql-server `0.24.33`, the build Conjure pinned before this fork).
 - **Image:** `ghcr.io/factory-kyle-mistele/libsql-server:<version>-conjure.<n>` (also tagged `v<version>-conjure.<n>`), for `linux/amd64` and `linux/arm64`. Its labels carry the fork commit (`org.opencontainers.image.revision`), the upstream repository, version and commit (`dev.conjure.upstream.repository`, `dev.conjure.upstream.version`, `dev.conjure.upstream.commit`) and the fork (`org.opencontainers.image.source`).
-- **The patch:** the metastore flush that ends every namespace fork took the `configs` mutex and then `conn`, while a namespace delete (`MetaStore::remove`) takes `conn` and then `configs`. A fork finishing during a delete deadlocked both, and then every namespace call (create, fork, delete, config, every Hrana request) hung until sqld restarted, while `/health` still answered. The flush now takes `conn` first, as `remove` does (`libsql-server/src/namespace/meta_store.rs`); `flushes_and_removes_at_once_do_not_deadlock` in the same file is its regression test. [`.github/conjure-fork-delete-repro.mjs`](.github/conjure-fork-delete-repro.mjs) reproduces the deadlock against a running image (`IMAGE=<image> node .github/conjure-fork-delete-repro.mjs <forks per round> <trials>`, needs Docker and Node 18 or later): stock images deadlock within a few rounds, this fork's run 2000 rounds.
-- **Drop this fork** once an upstream libsql-server release takes the two mutexes in one order: point Conjure back at `ghcr.io/tursodatabase/libsql-server` by digest.
+- **The patch:** the metastore flush that ends every namespace fork took the `configs` mutex and then `conn`, while a namespace delete (`MetaStore::remove`) takes `conn` and then `configs`. A fork finishing during a delete deadlocked both, and then every namespace call (create, fork, delete, config, every Hrana request) hung until sqld restarted, while `/health` still answered. The flush now takes `conn` first, as `remove` does (`libsql-server/src/namespace/meta_store.rs`); `flushes_and_removes_at_once_do_not_deadlock` in the same file is its regression test. [`conjure/fork-delete-deadlock/`](conjure/fork-delete-deadlock/README.md) is the end-to-end proof: `node conjure/fork-delete-deadlock/repro.mjs` (needs Docker and Node 18 or later) races forks and deletes against stock libsql-server and this fork's image, and passes only if stock deadlocks and the fork does not.
+- **Drop this fork** once an upstream libsql-server release takes the two mutexes in one order: check that `FORK_IMAGE=ghcr.io/tursodatabase/libsql-server@sha256:<digest> node conjure/fork-delete-deadlock/repro.mjs` passes on that release, then point Conjure back at it by digest.
 
 ## CI
 
@@ -17,7 +17,8 @@ This fork builds the `libsql-server` (sqld) image that Conjure runs, with two ch
 2. Pick the next number: `n` is one more than the highest `v<version>-conjure.<n>` tag for this upstream version (`git tag -l 'v0.24.33-conjure.*'`), or `1` after a rebase onto a new upstream version.
 3. Tag and push: `git tag -a v0.24.33-conjure.2 -m "libsql-server 0.24.33, conjure.2: <what changed>" && git push origin v0.24.33-conjure.2`.
 4. When the `conjure` run for the tag finishes, its summary shows the tag and its digest. A new package starts private: the first publish needed **Package settings → Change visibility → Public** on GitHub, once.
-5. In Conjure, pin `ghcr.io/factory-kyle-mistele/libsql-server:<version>-conjure.<n>@sha256:<digest>` where sqld runs (see Conjure's `docs/sqld-fork.md`).
+5. Run the end-to-end proof against the published image and check that it passes: `FORK_IMAGE=ghcr.io/factory-kyle-mistele/libsql-server:<version>-conjure.<n>@sha256:<digest> node conjure/fork-delete-deadlock/repro.mjs`.
+6. In Conjure, pin `ghcr.io/factory-kyle-mistele/libsql-server:<version>-conjure.<n>@sha256:<digest>` where sqld runs (see Conjure's `docs/sqld-fork.md`).
 
 ## Rebase onto a new upstream release
 
@@ -25,7 +26,7 @@ This fork builds the `libsql-server` (sqld) image that Conjure runs, with two ch
 2. Check first whether upstream fixed the lock order (`MetaStore::remove` and the flush branch of `process()` in `libsql-server/src/namespace/meta_store.rs`). If it did, drop this fork instead (above).
 3. Branch from the new base and replay the fork's commits (every commit on `conjure` after `UPSTREAM_COMMIT`): `git switch -c conjure/<new-version> <upstream tag or commit> && git cherry-pick <UPSTREAM_COMMIT>..conjure`. Conflicts are usually only this README section; drop the bookworm commit if upstream's `Dockerfile` has moved past bullseye.
 4. Update `.github/conjure-upstream.env` (`UPSTREAM_VERSION` from `libsql-server/Cargo.toml`, `UPSTREAM_COMMIT` the new base), and commit.
-5. Push `conjure/<new-version>`; CI runs the regression test and builds both images. Then move `conjure` to it (`git push origin conjure/<new-version>:conjure --force-with-lease`, after Conjure's tests pass on the image) and release as above, starting at `conjure.1`.
+5. Push `conjure/<new-version>`; CI runs the regression test and builds both images. Then move `conjure` to it (`git push origin conjure/<new-version>:conjure --force-with-lease`, after `conjure/fork-delete-deadlock/repro.mjs` and Conjure's tests pass on the image) and release as above, starting at `conjure.1`.
 
 ---
 <!-- markdownlint-disable MD033 MD041 -->
